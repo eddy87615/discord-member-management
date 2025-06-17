@@ -1,0 +1,25 @@
+# 依賴套件
+node_modules/
+
+# 環境變數檔案 (包含敏感資訊)
+.env
+.env.local
+.env.production
+
+# 日誌檔案
+*.log
+npm-debug.log*
+
+# macOS 系統檔案
+.DS_Store
+
+# Windows 系統檔案
+Thumbs.db
+
+# IDE 設定檔案
+.vscode/
+.idea/
+
+# 臨時檔案
+*.tmp
+*.temp.env
