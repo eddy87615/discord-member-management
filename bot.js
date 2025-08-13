@@ -78,6 +78,7 @@ let marriageData = {};
 let proposalData = {};
 let divorceData = {};
 let mutedMembers = {};
+let pendingRegistrations = {};
 
 // Google Sheets 服務
 let sheetsService;
@@ -165,10 +166,47 @@ async function addToGoogleSheets(userData) {
   }
 }
 
-// 檢查是否為重複報名
+// 更新Google試算表中的現有資料
+async function updateGoogleSheets(userData, rowIndex) {
+  if (!sheetsService) {
+    console.error("Google Sheets 服務未初始化");
+    return false;
+  }
+
+  try {
+    const values = [
+      [
+        userData.發文者,
+        userData.職業,
+        userData.等級,
+        userData.乾表,
+        userData.可打時間,
+        userData.發文時間,
+      ],
+    ];
+
+    const request = {
+      spreadsheetId: config.sheets.spreadsheetId,
+      range: `(不要亂動)總表!A${rowIndex + 1}:F${rowIndex + 1}`,
+      valueInputOption: "USER_ENTERED",
+      resource: {
+        values: values,
+      },
+    };
+
+    const response = await sheetsService.spreadsheets.values.update(request);
+    console.log(`✅ 資料已更新到試算表第 ${rowIndex + 1} 行`);
+    return true;
+  } catch (error) {
+    console.error("❌ 更新資料到試算表失敗:", error);
+    return false;
+  }
+}
+
+// 檢查是否為重複報名並返回行索引
 async function checkDuplicateRegistration(username) {
   if (!sheetsService) {
-    return false;
+    return { isDuplicate: false, rowIndex: -1 };
   }
 
   try {
@@ -181,14 +219,14 @@ async function checkDuplicateRegistration(username) {
 
     for (let i = 1; i < values.length; i++) {
       if (values[i][0] === username) {
-        return true;
+        return { isDuplicate: true, rowIndex: i };
       }
     }
 
-    return false;
+    return { isDuplicate: false, rowIndex: -1 };
   } catch (error) {
     console.error("檢查重複報名時出錯:", error);
-    return false;
+    return { isDuplicate: false, rowIndex: -1 };
   }
 }
 
@@ -370,6 +408,21 @@ function cleanExpiredDivorces() {
     }
   }
   saveDivorces();
+}
+
+// 清理過期報名選擇
+function cleanExpiredRegistrations() {
+  const now = Date.now();
+  const expiredTime = 10 * 60 * 1000; // 10分鐘過期
+
+  for (const registrationId in pendingRegistrations) {
+    const registration = pendingRegistrations[registrationId];
+    const registrationTime = parseInt(registrationId.split("_")[1]);
+    if (now - registrationTime > expiredTime) {
+      delete pendingRegistrations[registrationId];
+      console.log(`報名選擇 ${registrationId} 已過期並被清理`);
+    }
+  }
 }
 
 // 檢查禁言到期
@@ -712,6 +765,9 @@ client.on("messageCreate", async (message) => {
   if (!sheetsService || !config.sheets.reportChannelId) return;
   if (message.channel.id !== config.sheets.reportChannelId) return;
 
+  // 清理過期的報名選擇
+  cleanExpiredRegistrations();
+
   const registrationData = parseRegistrationMessage(message.content);
 
   if (!registrationData) {
@@ -739,22 +795,87 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  const isDuplicate = await checkDuplicateRegistration(
+  const duplicateCheck = await checkDuplicateRegistration(
     message.author.displayName || message.author.username
   );
 
-  if (isDuplicate) {
+  if (duplicateCheck.isDuplicate) {
+    const updateButton = new ButtonBuilder()
+      .setCustomId(`update_registration_${message.author.id}_${Date.now()}`)
+      .setLabel("🔄 更新資料")
+      .setStyle(ButtonStyle.Primary);
+
+    const addNewButton = new ButtonBuilder()
+      .setCustomId(`add_new_registration_${message.author.id}_${Date.now()}`)
+      .setLabel("➕ 新增資料")
+      .setStyle(ButtonStyle.Secondary);
+
+    const row = new ActionRowBuilder().addComponents(
+      updateButton,
+      addNewButton
+    );
+
     const duplicateEmbed = new EmbedBuilder()
       .setColor("#FFA500")
-      .setTitle("⚠️ 重複報名")
-      .setDescription("你已經報名過了！如需修改請聯繫管理員。")
-      .setFooter({ text: "每人只能報名一次" });
+      .setTitle("⚠️ 偵測到重複報名")
+      .setDescription("你已經報名過了！請選擇要如何處理：")
+      .addFields(
+        { name: "🔄 更新資料", value: "更新你現有的報名資料", inline: true },
+        { name: "➕ 新增資料", value: "新增一筆新的報名資料", inline: true }
+      )
+      .setFooter({ text: "只有你可以進行操作" });
+
+    // 儲存待處理的報名資料
+    const registrationId = `${message.author.id}_${Date.now()}`;
+    pendingRegistrations[registrationId] = {
+      userData: {
+        發文者: message.author.displayName || message.author.username,
+        職業: registrationData.職業,
+        等級: registrationData.等級,
+        乾表: registrationData.乾表,
+        可打時間: registrationData.可打時間,
+        發文時間: new Date()
+          .toLocaleString("zh-TW", {
+            timeZone: "Asia/Taipei",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+          })
+          .replace(/\//g, "/"),
+      },
+      rowIndex: duplicateCheck.rowIndex,
+      messageId: message.id,
+      userId: message.author.id,
+    };
 
     try {
-      await message.reply({ embeds: [duplicateEmbed] });
+      // 創建一個只有發送者可以看到的回應
+      const followUpMessage = await message.channel.send({
+        content: `<@${message.author.id}>`,
+        embeds: [duplicateEmbed],
+        components: [row],
+      });
+
+      // 立即刪除原始訊息
       await message.delete();
+
+      // 5分鐘後自動刪除選擇訊息（如果使用者沒有選擇）
+      setTimeout(async () => {
+        try {
+          await followUpMessage.delete();
+          // 從待處理列表中移除
+          for (const [id, data] of Object.entries(pendingRegistrations)) {
+            if (data.userId === message.author.id) {
+              delete pendingRegistrations[id];
+              break;
+            }
+          }
+        } catch (deleteError) {
+          console.log("刪除過期選擇訊息失敗:", deleteError.message);
+        }
+      }, 5 * 60 * 1000);
     } catch (error) {
-      console.log("發送重複報名提醒失敗:", error.message);
+      console.log("發送重複報名選擇失敗:", error.message);
     }
     return;
   }
@@ -1323,6 +1444,11 @@ async function handleButtonInteraction(interaction) {
     customId.startsWith("divorce_reject_")
   ) {
     await handleDivorceButtons(interaction, customId);
+  } else if (
+    customId.startsWith("update_registration_") ||
+    customId.startsWith("add_new_registration_")
+  ) {
+    await handleRegistrationButtons(interaction, customId);
   }
 }
 
@@ -1428,6 +1554,84 @@ async function handleDivorceButtons(interaction, customId) {
   }
 }
 
+// 處理報名選擇按鈕
+async function handleRegistrationButtons(interaction, customId) {
+  // 解析customId找到相對應的報名資料
+  const userId = interaction.user.id;
+  let registrationEntry = null;
+  let registrationId = null;
+
+  // 在pendingRegistrations中找到屬於這個使用者的報名資料
+  for (const [id, data] of Object.entries(pendingRegistrations)) {
+    if (data.userId === userId) {
+      registrationEntry = data;
+      registrationId = id;
+      break;
+    }
+  }
+
+  if (!registrationEntry) {
+    await interaction.reply({
+      content: "❌ 找不到相對應的報名資料！",
+      flags: 64,
+    });
+    return;
+  }
+
+  let success = false;
+  let actionText = "";
+
+  if (customId.startsWith("update_registration_")) {
+    // 更新現有資料
+    success = await updateGoogleSheets(
+      registrationEntry.userData,
+      registrationEntry.rowIndex
+    );
+    actionText = "更新";
+  } else if (customId.startsWith("add_new_registration_")) {
+    // 新增新資料
+    success = await addToGoogleSheets(registrationEntry.userData);
+    actionText = "新增";
+  }
+
+  // 清除待處理的報名資料
+  delete pendingRegistrations[registrationId];
+
+  if (success) {
+    const successEmbed = new EmbedBuilder()
+      .setColor("#32CD32")
+      .setTitle(`✅ ${actionText}報名成功`)
+      .setDescription(
+        `${registrationEntry.userData.發文者} 的報名資料已${actionText}！`
+      )
+      .addFields(
+        { name: "職業", value: registrationEntry.userData.職業, inline: true },
+        { name: "等級", value: registrationEntry.userData.等級, inline: true },
+        { name: "乾表", value: registrationEntry.userData.乾表, inline: true },
+        { name: "可打時間", value: registrationEntry.userData.可打時間 },
+        { name: "報名時間", value: registrationEntry.userData.發文時間 }
+      )
+      .setThumbnail(interaction.user.displayAvatarURL())
+      .setFooter({ text: "資料已同步至試算表" });
+
+    await interaction.update({
+      embeds: [successEmbed],
+      components: [],
+    });
+  } else {
+    const errorEmbed = new EmbedBuilder()
+      .setColor("#FF0000")
+      .setTitle(`❌ ${actionText}報名失敗`)
+      .setDescription("儲存到試算表時發生錯誤，請聯繫管理員。")
+      .setFooter({ text: "請稍後再試或聯繫技術支援" });
+
+    await interaction.update({
+      embeds: [errorEmbed],
+      components: [],
+    });
+  }
+}
+
 // 機器人就緒事件
 client.once("ready", async () => {
   console.log(`機器人已登入: ${client.user.tag}`);
@@ -1451,6 +1655,7 @@ client.once("ready", async () => {
   setInterval(() => {
     cleanExpiredProposals();
     cleanExpiredDivorces();
+    cleanExpiredRegistrations();
   }, 10 * 60 * 1000);
 
   setInterval(checkMutedMembers, 1 * 60 * 1000);
