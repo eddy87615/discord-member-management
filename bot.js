@@ -810,9 +810,15 @@ client.on("messageCreate", async (message) => {
       .setLabel("➕ 新增資料")
       .setStyle(ButtonStyle.Secondary);
 
+    const cancelButton = new ButtonBuilder()
+      .setCustomId(`cancel_registration_${message.author.id}_${Date.now()}`)
+      .setLabel("❌ 取消操作")
+      .setStyle(ButtonStyle.Danger);
+
     const row = new ActionRowBuilder().addComponents(
       updateButton,
-      addNewButton
+      addNewButton,
+      cancelButton
     );
 
     const duplicateEmbed = new EmbedBuilder()
@@ -821,9 +827,10 @@ client.on("messageCreate", async (message) => {
       .setDescription("你已經報名過了！請選擇要如何處理：")
       .addFields(
         { name: "🔄 更新資料", value: "更新你現有的報名資料", inline: true },
-        { name: "➕ 新增資料", value: "新增一筆新的報名資料", inline: true }
+        { name: "➕ 新增資料", value: "新增一筆新的報名資料", inline: true },
+        { name: "❌ 取消操作", value: "取消此次報名並刪除訊息", inline: true }
       )
-      .setFooter({ text: "只有你可以進行操作" });
+      .setFooter({ text: "請選擇要執行的操作，只有你可以點擊按鈕" });
 
     // 儲存待處理的報名資料
     const registrationId = `${message.author.id}_${Date.now()}`;
@@ -849,26 +856,23 @@ client.on("messageCreate", async (message) => {
     };
 
     try {
-      // 創建一個只有發送者可以看到的回應
+      // 創建一個只有發送者可以看到的回應，但保留原始訊息
       const followUpMessage = await message.channel.send({
         content: `<@${message.author.id}>`,
         embeds: [duplicateEmbed],
         components: [row],
       });
 
-      // 立即刪除原始訊息
-      await message.delete();
+      // 儲存選擇訊息ID以便後續刪除
+      pendingRegistrations[registrationId].choiceMessageId = followUpMessage.id;
 
-      // 5分鐘後自動刪除選擇訊息（如果使用者沒有選擇）
+      // 5分鐘後自動刪除選擇訊息並清理（如果使用者沒有選擇）
       setTimeout(async () => {
         try {
           await followUpMessage.delete();
           // 從待處理列表中移除
-          for (const [id, data] of Object.entries(pendingRegistrations)) {
-            if (data.userId === message.author.id) {
-              delete pendingRegistrations[id];
-              break;
-            }
+          if (pendingRegistrations[registrationId]) {
+            delete pendingRegistrations[registrationId];
           }
         } catch (deleteError) {
           console.log("刪除過期選擇訊息失敗:", deleteError.message);
@@ -1446,7 +1450,8 @@ async function handleButtonInteraction(interaction) {
     await handleDivorceButtons(interaction, customId);
   } else if (
     customId.startsWith("update_registration_") ||
-    customId.startsWith("add_new_registration_")
+    customId.startsWith("add_new_registration_") ||
+    customId.startsWith("cancel_registration_")
   ) {
     await handleRegistrationButtons(interaction, customId);
   }
@@ -1578,6 +1583,44 @@ async function handleRegistrationButtons(interaction, customId) {
     return;
   }
 
+  // 處理取消操作
+  if (customId.startsWith("cancel_registration_")) {
+    try {
+      // 刪除原始報名訊息
+      const channel = interaction.channel;
+      const originalMessage = await channel.messages.fetch(registrationEntry.messageId);
+      await originalMessage.delete();
+      
+      // 刪除選擇訊息
+      await interaction.update({
+        content: "❌ 已取消報名操作，訊息已刪除。",
+        embeds: [],
+        components: []
+      });
+      
+      // 稍後刪除這個提示訊息
+      setTimeout(async () => {
+        try {
+          await interaction.deleteReply();
+        } catch (error) {
+          console.log("刪除取消提示失敗:", error.message);
+        }
+      }, 3000);
+      
+    } catch (error) {
+      console.log("刪除原始訊息失敗:", error.message);
+      await interaction.update({
+        content: "❌ 取消操作失敗，請手動刪除訊息。",
+        embeds: [],
+        components: []
+      });
+    }
+    
+    // 清除待處理的報名資料
+    delete pendingRegistrations[registrationId];
+    return;
+  }
+
   let success = false;
   let actionText = "";
 
@@ -1618,6 +1661,15 @@ async function handleRegistrationButtons(interaction, customId) {
       embeds: [successEmbed],
       components: [],
     });
+
+    // 成功後給原始訊息加上反應表示已處理
+    try {
+      const channel = interaction.channel;
+      const originalMessage = await channel.messages.fetch(registrationEntry.messageId);
+      await originalMessage.react("✅");
+    } catch (error) {
+      console.log("加上反應失敗:", error.message);
+    }
   } else {
     const errorEmbed = new EmbedBuilder()
       .setColor("#FF0000")
